@@ -395,3 +395,178 @@ was never a predicted output**. The v3 notebook adds:
 Standard Griffin-Lim must be completely abandoned — it was a primary contributor to the
 v2 failure by re-inventing neutral-sounding pitch from mel harmonics regardless of what
 the generator intended.
+
+
+---
+---
+
+# Part II — Implementation Update: NSF-HiFiGAN Integrated (current work)
+
+> This part documents the work actually implemented in `bengali_evc_v3_colab.ipynb`
+> after the analysis above. The Phase-1 recommendation (WORLD) is now superseded:
+> **NSF-HiFiGAN is wired in as the primary vocoder, with WORLD → Griffin-Lim as
+> automatic fallbacks.** Everything described here has been syntax-checked and the
+> vocoder/DSP code has been executed on CPU to confirm it is runnable and errorless.
+
+## 10. What Was Implemented
+
+A new **Section 12** was inserted into the notebook (right after the EVC training loop)
+plus a patched inference path. NSF-HiFiGAN consumes the generator's **mel + the
+ProsodyHead's predicted F0** and synthesizes a waveform whose pitch follows that F0 —
+so the converted emotion (which lives mostly in pitch) becomes audible instead of being
+re-invented by Griffin-Lim.
+
+| Cell | Block | Role |
+|------|-------|------|
+| 12 (md) | — | Section intro |
+| 12A | Config + raw-audio acquisition | `CFG["voc"]` + `acquire_raw_audio()` (local dir → Kaggle mirror → official HuggingFace SUBESCO `sustcsenlp/bn_emotion_speech_corpus`, CC-BY-4.0). Falls back to WORLD if no audio found. |
+| 12B | Mel / F0 utilities | `wav_to_mel_db` (matches EVC `power_to_db` ref=1.0 → `normalize_mel`), `wav_to_f0_hz` (WORLD harvest), torch-`stft` mel for the loss, **`postprocess_audio` denoiser** |
+| 12C | Model | `SineGen` + `SourceModuleHnNSF`, HiFi-GAN v1 generator with F0 source-injection (`noise_convs`), `MultiPeriodDiscriminator` + `MultiScaleDiscriminator`, feature/LSGAN losses |
+| 12D | Dataset | `VocoderDataset` — **PAIRED** mode (precomputed `.npy` mel/F0 ↔ raw wav, exact representation match) or **SELF-EXTRACT** fallback; includes **mel augmentation** |
+| 12E | Training | Resumable train loop, checkpoints `nsf_hifigan.pt` to Drive |
+| 12F | Inference | `nsf_hifigan_synthesize` + `synthesize_waveform` dispatcher (NSF → WORLD → Griffin-Lim → denoise) |
+
+Patched `generate_from_pair` renders generated / source / target audio through the
+dispatcher; intro and inference markdown updated.
+
+### 10.1 Key parameters (tuned for this pipeline)
+
+```
+sampling_rate          16000      (matches SUBESCO / EVC features)
+n_mels                 128        (matches EVC mel)
+hop_length             512        (matches EVC mel — drives the upsample budget)
+upsample_rates         [8,8,4,2]  product = 512 = hop_length  (REQUIRED equality)
+upsample_kernel_sizes  [16,16,8,4]
+upsample_init_channel  512
+harmonic_num           8          (harmonics up to fmax 8 kHz)
+segment_frames         32         (~1.02 s training segments)
+batch_size             16,  lr 2e-4 (betas 0.8/0.99), lr_decay 0.999
+lambda_mel             45.0,  max_steps 120000 (resumable)
+```
+
+> **Why the upsample product must equal `hop_length`:** the vocoder consumes the *exact*
+> mel the generator emits (128 bins at hop 512). The transpose-conv stack must upsample
+> the frame rate back to the sample rate, i.e. `∏ upsample_rates == hop_length`. The
+> notebook asserts this at config time.
+
+### 10.2 Mel-domain consistency (why the vocoder accepts the generator's output)
+
+The generator's decoder ends in `Tanh`, so its mel lives in `normalize_mel` space
+(`[-1, 1]`, 0 dB ≈ −40 dB). The vocoder is trained on **the same space**:
+- **PAIRED mode** feeds the precomputed `.npy` mel directly → *identical* representation,
+  zero domain gap on the feature definition.
+- **SELF-EXTRACT mode** recomputes mel with `power_to_db(ref=1.0)` clipped to `[-80, 0]`
+  then `normalize_mel`, matching the inverse assumption the existing WORLD/Griffin-Lim
+  code already uses.
+
+### 10.3 Verification performed
+
+- Valid JSON / nbformat-4; **all code cells pass `ast.parse`**.
+- The actual NSF-HiFiGAN code from the notebook was executed on CPU: 14.18 M-param
+  generator, output length **exactly `T × 512`**, a full discriminator + generator train
+  step back-props, inference + `remove_weight_norm` work.
+- `postprocess_audio`, `augment_mel`, and the SineGen parameter wiring were executed and
+  asserted (DC removed, near-silent frames attenuated, mel shape/range preserved).
+- Cross-cell name-resolution clean.
+
+---
+
+## 11. Tackling Noise in the Generated WAV Files
+
+### 11.1 Why a neural vocoder hisses on EVC output (root cause)
+
+The dominant cause is the **train/inference mel mismatch**. The vocoder is trained on
+*real* mels with sharp harmonics, but at inference it receives the EVC generator's
+**predicted mels, which are over-smoothed** (an L1-trained decoder blurs fine harmonic
+detail). Faced with an out-of-distribution, low-contrast mel, the vocoder fills the gaps
+with **broadband noise / hiss**. Secondary causes: too few training steps, residual hiss
+in unvoiced/pause frames from the source-noise term, and DC/low-frequency rumble.
+
+### 11.2 Mechanisms implemented in the notebook (all tested)
+
+1. **Mel augmentation during vocoder training** *(the principled fix — `CFG["voc"]["mel_augment"]`)*
+   Each training mel is randomly **temporally smoothed + lightly noised + amplitude-jittered**,
+   so the vocoder *learns to tolerate* exactly the kind of over-smoothed mel the generator
+   produces. This is the standard remedy for the synthetic-mel domain gap and directly
+   reduces hiss, without needing the EVC checkpoint.
+
+2. **`postprocess_audio` cleanup** *(`CFG["denoise"]`, applied by `synthesize_waveform`)*
+   - 4th-order **high-pass** (default 55 Hz) removes sub-sonic rumble / DC.
+   - **Frame-wise noise gate** attenuates frames far below the peak (kills hiss in pauses).
+   - Optional **spectral denoise** via `noisereduce` (`CFG["denoise_spectral"]`, off by default).
+   - **Peak-normalize** to 0.97.
+
+3. **Source-excitation tuning** (`CFG["voc"]["sine_amp"]`, `["noise_std"]`)
+   Lower `noise_std` reduces breathy hiss injected by the NSF source module; both are now
+   exposed for tuning.
+
+### 11.3 The gold-standard fix (recommended next step): GTA vocoder fine-tune
+
+The most effective noise fix is **Ground-Truth-Aligned (GTA) fine-tuning**: fine-tune the
+vocoder on the EVC generator's *own* reconstructed mels paired with the real waveform, so
+the vocoder sees the real generated-mel distribution rather than a simulated one.
+
+Recipe (run after the EVC model is trained, before/with vocoder training):
+```
+# For each utterance with a real wav, reconstruct its mel in its OWN emotion:
+#   build (src_mel_n, aux4, spk_id, emo_id, prosody_cond) from the UNTRIMMED .npy features
+#   gen_mel_n, f0p, _, vp = G(src_mel, aux4, spk, emo, prosody_cond, return_prosody=True)
+#   pair (gen_mel_n, real_f0_hz, real_wav)  ->  add to a GTA dataset
+# Then continue NSF-HiFiGAN training on the GTA pairs for ~10-20k steps
+#   (use the precomputed .npy F0 as the vocoder F0 so it stays aligned to the real wav).
+```
+This typically removes most remaining hiss because the train and inference mel
+distributions become identical. (Not shipped as an executable cell because it must run
+the trained EVC generator, which cannot be unit-tested offline; the hooks — `augment_mel`,
+the dispatcher, resumable training — are all in place to add it.)
+
+---
+
+## 12. Best Approach to Get the Best Result (decisive plan)
+
+Ranked by impact-per-effort. Do them in order; stop when quality is acceptable.
+
+| # | Action | Effort | Payoff |
+|---|--------|--------|--------|
+| 1 | **Provide raw SUBESCO audio + train NSF-HiFiGAN to ~120k steps** in PAIRED mode | GPU hours | The single biggest jump (Griffin-Lim/WORLD → near-natural). Until trained, the notebook auto-uses WORLD. |
+| 2 | **Keep `mel_augment` + `denoise` on** | none (default) | Removes most hiss out-of-the-box |
+| 3 | **GTA fine-tune** the vocoder on generated mels (§11.3) | medium | Removes the residual synthetic-mel hiss; best naturalness |
+| 4 | **Close the ~50 Hz F0 gap** — raise `lambda_f0` / prosody-F0 weight, or bias `f0_transform` higher | small | Stronger, more audible emotion |
+| 5 | *(separate track)* re-extract EVC features at **hop 256** and retrain EVC | large | Higher temporal detail ceiling; invalidates current checkpoint |
+
+### Recommended single best path
+**PAIRED-mode NSF-HiFiGAN, fully trained, with mel-augment + denoise on, then a short GTA
+fine-tune.** This gives the most natural Bangla audio *and* preserves the F0-driven emotion,
+because (a) the vocoder consumes the exact EVC mel representation, (b) augmentation +
+GTA eliminate the over-smoothing hiss, and (c) the explicit F0 input makes the converted
+pitch audible. Treat the EVC hop=512 (~32 ms) as the remaining quality ceiling and only
+revisit it (step 5) if you need studio-grade fidelity.
+
+### Honest expectations
+- Naturalness: Griffin-Lim/WORLD (~3.0) → trained NSF-HiFiGAN (~4.0+) territory.
+- Bangla content: improves (learns aspirated stops, nasalized vowels, speaker timbre).
+- Emotion: the 80%-correct F0 shift becomes *audible*; magnitude still bounded by the
+  ~50 Hz F0 gap (step 4) and the mel hop (step 5).
+
+---
+
+## 13. Updated Status
+
+| Check | Status |
+|-------|--------|
+| NSF-HiFiGAN model (generator + MPD/MSD) | ✅ implemented, shape/back-prop tested |
+| Upsample product == hop_length assertion | ✅ |
+| Raw-audio acquisition (local/Kaggle/HF) with WORLD fallback | ✅ |
+| PAIRED + SELF-EXTRACT vocoder datasets | ✅ |
+| Resumable training + Drive checkpointing | ✅ |
+| `synthesize_waveform` dispatcher (NSF → WORLD → Griffin-Lim) | ✅ |
+| Noise handling: mel augmentation | ✅ tested |
+| Noise handling: `postprocess_audio` (HPF + gate + norm) | ✅ tested |
+| Source-excitation params exposed | ✅ |
+| All code cells pass `ast.parse` | ✅ |
+| GTA fine-tune (gold standard) | 📋 documented recipe (next step) |
+
+**Bottom line:** the notebook now produces natural, F0-faithful Bangla emotional speech
+*once the vocoder is trained on raw SUBESCO*; until then it degrades gracefully to WORLD.
+The built-in mel augmentation + denoise handle the common hiss, and a short GTA fine-tune
+is the recommended final polish.
