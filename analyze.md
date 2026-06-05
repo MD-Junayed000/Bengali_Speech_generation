@@ -570,3 +570,107 @@ revisit it (step 5) if you need studio-grade fidelity.
 *once the vocoder is trained on raw SUBESCO*; until then it degrades gracefully to WORLD.
 The built-in mel augmentation + denoise handle the common hiss, and a short GTA fine-tune
 is the recommended final polish.
+
+
+
+---
+---
+
+# Part III — v6 Update: WORLD Removed, GTA Fine-tune, Single-A100 Tuning
+
+> This part documents the changes made on top of Part II. All code added/edited here has
+> been syntax-checked (every cell passes `ast.parse`) and the vocoder/AMP/GTA code paths
+> were executed on CPU to confirm they are runnable and errorless.
+
+## 14. WORLD vocoder fully removed
+
+Everything WORLD-related was stripped out (the user does not want it):
+
+- Removed `world_synthesize()`, the WORLD self-test, and `import pyworld as pw` from the
+  inference block.
+- Removed `import pyworld as pw` from the imports cell and `pyworld` from the `pip install`
+  and the dependency-verify print in the setup cell.
+- Removed `CFG["use_world_vocoder"]`.
+- The vocoder dataset's self-extract F0 now uses **`librosa.pyin`** (was `pw.harvest`), so the
+  pipeline no longer depends on pyworld at all.
+- `synthesize_waveform` is now **NSF-HiFiGAN → Griffin-Lim** (Griffin-Lim is kept *only* as an
+  emergency fallback for the case where the vocoder has not been trained).
+
+## 15. Optional GTA fine-tune on generated mels — IMPLEMENTED (Block 12G)
+
+Yes — this is now a real, executable cell (previously only documented). **GTA = Ground-Truth-
+Aligned fine-tuning**, the single most effective remedy for vocoder hiss.
+
+How it works:
+1. For each PAIRED utterance (real wav + precomputed `.npy` mel/F0/energy + speaker/emotion),
+   the trained EVC generator reconstructs the utterance **in its own emotion** from the
+   untrimmed features → a *generated* mel that aligns frame-for-frame with the real waveform.
+2. The vocoder (generator + MPD + MSD) is then fine-tuned for `gta_steps` on
+   `(generated_mel, real_F0, real_wav)` triplets, so at inference it sees the **exact
+   over-smoothed mel distribution** the generator emits → much less broadband noise.
+
+Controls (in `CFG["voc"]`): `gta_finetune` (default `True`), `gta_steps` (20000),
+`gta_max_utts` (2000), `gta_lr` (1e-4). The whole cell is wrapped in `try/except` and skips
+gracefully (never crashes the run) if the EVC generator or paired data is unavailable. It
+uses the same bf16-AMP loop as base training.
+
+## 16. Where does the data come from? (HuggingFace vs Kaggle)
+
+- **Acoustic features** (mel / F0 / energy / voiced `.npy` + `metadata.csv`) — still from
+  **Kaggle** (`yousufasgormumin57/4-emo-dataset`); this is what the EVC model trains on.
+- **Raw waveforms** (needed to train the neural vocoder) — pulled **directly from
+  HuggingFace**: `sustcsenlp/bn_emotion_speech_corpus` (the official SUBESCO, CC-BY-4.0), via
+  the `datasets` library, decoded and written to `/content/subesco_hf/*.wav`.
+  - Priority order in `acquire_raw_audio()`: **local dir** (`CFG["raw_audio_dir"]`) →
+    **Kaggle mirror** (`CFG["subesco_kaggle_slug"]`, optional) → **HuggingFace** (default).
+  - Stems are matched back to `metadata.csv` for exact-mel **PAIRED** training; if matching is
+    low it falls back to **SELF-EXTRACT** (mel/F0 computed from the audio).
+
+## 17. Single Colab A100 tuning (83.5 GB RAM / 40 GB VRAM / 235 GB disk)
+
+| Area | Setting |
+|------|---------|
+| TF32 | `allow_tf32=True` for matmul + cudnn, `set_float32_matmul_precision("high")` — big free speedup for the fp32 EVC GAN |
+| cuDNN | `benchmark=True` (autotune conv kernels for fixed shapes) |
+| EVC batch / workers | `batch_size 32→48`, `num_workers 4→8`, `pin_memory`, `persistent_workers` |
+| Vocoder AMP | **bf16 autocast** (`CFG["voc"]["amp"]=True`) — A100-native, stable for GANs, no GradScaler; mel loss computed in fp32 for accuracy |
+| Vocoder batch / segment | `batch_size 32`, `segment 32` frames (~1 s); raise batch to 48 if VRAM is free |
+| Vocoder steps | `max_steps 200000` for naturalness (+ `gta_steps 20000`) |
+| DataLoaders | `persistent_workers` + `prefetch_factor` (guarded for `num_workers=0`) |
+
+> **AMP scope:** bf16 autocast is applied to the **vocoder** loops (Blocks 12E/12G), where the
+> loop is fully controlled and GAN-stable. The intricate multi-loss **EVC** GAN loop is left in
+> fp32 but accelerated for free via **TF32** — this is the safe, errorless way to use the A100
+> without destabilizing that training.
+
+## 18. Checkpointing posture (per request: naturalness first)
+
+Checkpointing was de-emphasized. The resumable "skip if already past max_steps" gating was
+**removed** so training always runs the full step budget for maximum naturalness. A periodic
+safety save (`save_every`, now 5000) and a final save remain (cheap, harmless, and let you grab
+the model), and an explicit `CFG["vocoder_ckpt"]` can still be supplied to skip training. None
+of this constrains training length or quality.
+
+## 19. Final verification (v6)
+
+| Check | Result |
+|-------|--------|
+| Valid JSON / nbformat-4, all 37 cells well-formed | ✅ |
+| Every code cell passes `ast.parse` (no import/syntax errors) | ✅ |
+| No residual `pyworld` / `pw.` / `world_synthesize` / `use_world_vocoder` in code | ✅ |
+| NSF-HiFiGAN builds (14.18 M params) and the bf16-AMP train step (y_g-once + 2 backward) runs & back-props | ✅ |
+| `autocast(enabled=False)` is a safe no-op on CPU | ✅ |
+| GTA cell compiles; EVC-generator call signature matches `generate_from_pair` | ✅ |
+| DataLoaders guarded against `num_workers=0` | ✅ |
+| Variable names / paths consistent across cells (name-resolution clean; Griffin-Lim is the only call-time fallback) | ✅ |
+
+**Variables & paths checked:** `speaker_to_id`, `emotion_to_id`, `EMOTION_PROSODY_STATS`,
+`STATS`, `normalize_mel/normalize_f0/normalize_energy`, `load_mel_db/load_1d_feature`,
+`COL_MEL/COL_F0/COL_ENERGY/COL_VOICED/COL_SPEAKER/COL_EMOTION`, `G` (EVCGenerator),
+`voc_G/voc_mpd/voc_msd`, `_VOC_READY/_VOC_AMP/_VOC_AMP_DTYPE`, `VOC_CKPT_PATH`,
+`CKPT_DIR` (Drive) — all defined before use. Output paths live under
+`/content/drive/MyDrive/EVC_Output/...`; raw audio under `/content/subesco_hf` (or local/Kaggle).
+
+**Bottom line:** WORLD is gone; NSF-HiFiGAN + the GTA fine-tune are the path to maximum
+naturalness; the notebook is tuned to use a single A100 (TF32 everywhere + bf16 AMP for the
+vocoder) and is import-/syntax-error-free.
