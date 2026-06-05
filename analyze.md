@@ -19,8 +19,15 @@ model, and renders audio with an **NSF-HiFiGAN** neural vocoder.
 - **20 speakers** (10 M / 10 F), **10 sentences**, **7 emotions**
   (angry, disgust, fear, happy, neutral, sad, surprise). This notebook keeps the four it
   converts between: **neutral → {angry, happy, sad}**.
-- **Access:** no token or credentials required (public dataset). Pulled via the
-  `datasets` library; an optional `HF_TOKEN` only raises rate limits.
+- **Access:** no token or credentials required (public dataset). An optional `HF_TOKEN`
+  only raises rate limits.
+- **Download method (important):** the repo ships a *dataset loading script*
+  (`bn_emotion_speech_corpus.py`), which newer `datasets` (v3+) refuses to run
+  (`RuntimeError: Dataset scripts are no longer supported`). So the notebook does **not**
+  call `load_dataset`; instead it downloads the single archive `subesco.tar.gz` (~1.6 GB)
+  directly with `huggingface_hub.hf_hub_download` and stream-extracts the wavs. A
+  `load_dataset(..., trust_remote_code=True)` path remains only as a fallback for old
+  `datasets` versions.
 - **Kaggle mirror:** not used. A community Kaggle mirror exists but is unnecessary —
   the official HF dataset is authoritative and license-clean. (Content rephrased for
   licensing compliance.)
@@ -35,8 +42,8 @@ model, and renders audio with an **NSF-HiFiGAN** neural vocoder.
 
 | Block | What it does |
 |-------|--------------|
-| **1 — Setup** | Mount Drive; `pip install librosa soundfile scipy datasets huggingface_hub`. No Kaggle. |
-| **2 — Download** | `load_dataset("sustcsenlp/bn_emotion_speech_corpus")`; decode each clip and write `/content/subesco_audio/<id>.wav` (runs once; skips if already present). |
+| **1 — Setup** | Mount Drive; `pip install librosa soundfile scipy huggingface_hub datasets`. No Kaggle. |
+| **2 — Download** | `hf_hub_download(...,"subesco.tar.gz")` then stream-extract every wav to `/content/subesco_audio/<id>.wav` (runs once; skips if already present; `load_dataset` fallback for old `datasets`). |
 | **3 — Config** | Imports, seeds, **A100 TF32**, paths, the global `CFG`. Output goes to Google Drive. |
 | **4 — Feature extraction** | Parse each filename → `(speaker, sentence, take, emotion)`; compute **mel(dB)**, **F0**, **energy**, **voiced**; save `.npy`; write `metadata.csv`. |
 | **5 — Metadata** | Load `metadata.csv`, map columns, resolve `.npy` paths. |
@@ -162,6 +169,8 @@ the vocoder loops, which are GAN-stable that way. Fits comfortably in 40 GB VRAM
 | Valid JSON / nbformat-4, 37 well-formed cells | ✅ |
 | Every code cell passes `ast.parse` (no import/syntax errors) | ✅ |
 | **Zero** references to `kaggle` / `pyworld` / `WORLD` in code | ✅ |
+| BLOCK 2 downloads via `hf_hub_download("subesco.tar.gz")` + tar stream-extract (no dataset script); `load_dataset` only as fallback | ✅ |
+| Tar-extraction logic executed on a synthetic archive (nested paths, non-wav ignored, 16 kHz wavs) | ✅ |
 | Block 4 extraction executed on a test clip → correct mel `(128, T)` in `[-80, 0]`, F0, energy, voiced shapes | ✅ |
 | `metadata.csv` columns satisfy Block 5 `pick_col()` (required + `wav_path`) | ✅ |
 | Filename parser → clean speaker (`F_01_OISHI`), correct sentence/take/emotion | ✅ |
